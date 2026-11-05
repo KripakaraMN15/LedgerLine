@@ -50,7 +50,11 @@ class CodeArtifact(BaseModel):
     language: str = "python"
     source: str
     stdout: str | None = None
+    stderr: str = ""
     exit_code: int | None = None
+    timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 class ReviewVerdict(BaseModel):
