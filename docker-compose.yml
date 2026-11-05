@@ -9,6 +9,11 @@ services:
       POSTGRES_PASSWORD: vendorops
     ports:
       - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U vendorops -d vendorops']
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   phoenix:
     image: arizephoenix/phoenix:latest
