@@ -22,6 +22,11 @@ services:
     ports:
       - '127.0.0.1:6006:6006'
       - '127.0.0.1:4317:4317'
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6006/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   mock-llm:
     build:
@@ -63,7 +68,7 @@ services:
       postgres:
         condition: service_healthy
       phoenix:
-        condition: service_started
+        condition: service_healthy
       mock-llm:
         condition: service_healthy
       mock-vendor:
