@@ -171,7 +171,7 @@ Never put secrets or raw PII in span attributes; log hashes instead.
 
 - Every tool is registered with a Pydantic input model and output model.
 - The router validates LLM-produced args against the input model. On `ValidationError`, it retries the LLM call with the error text appended, up to `max_tool_retries` (default 2). After that, the call returns `ToolResult(ok=False)`.
-- After a retryable tool execution failure, the agent feeds a bounded, sanitized error summary back to the model and allows up to three repair attempts after the original call. Every repair LLM request uses `LLMClient` and counts against the task budget and step limit. Authentication failures and 4xx responses other than 429 fail without repair. Repair calls retain the original loop detector and increment the `ToolCall.attempt` value.
+- After a tool execution 404, the agent feeds a bounded, sanitized error summary back to the model and allows up to three repair attempts after the original call. Every repair LLM request uses `LLMClient` and counts against the task budget and step limit. Timeouts and transient 5xx/429 errors are retried by the external client with backoff and do not trigger LLM repair; authentication failures and other 4xx responses fail without repair. Repair calls retain the original loop detector and increment the `ToolCall.attempt` value.
 - Tools never raise into the agent loop. All failures become `ToolResult(ok=False, error=...)`.
 - Every external call has a timeout, and retries use exponential backoff with jitter.
 - Tools that move money (even mock money) must require an approved `approval_id`; the tool itself checks it, not just the agent.

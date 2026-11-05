@@ -248,7 +248,6 @@ class ToolRouter:
                     tool_call.id,
                     f"Tool call exceeded {self._total_timeout:g}s time limit",
                     int(self._total_timeout * 1000),
-                    retryable=True,
                 )
                 if checkpoint is not None:
                     await checkpoint()
@@ -321,7 +320,7 @@ class ToolRouter:
                 ok=False,
                 error=str(error) or "Tool execution failed",
                 latency_ms=self._latency_ms(started),
-                retryable=self._is_retryable_error(error),
+                retryable=self._is_repairable_error(error),
                 error_code=(
                     error.response.status_code
                     if isinstance(error, httpx.HTTPStatusError)
@@ -406,13 +405,10 @@ class ToolRouter:
         return message
 
     @staticmethod
-    def _is_retryable_error(error: Exception) -> bool:
+    def _is_repairable_error(error: Exception) -> bool:
         if isinstance(error, httpx.HTTPStatusError):
-            status_code = error.response.status_code
-            return status_code == 429 or status_code >= 500
-        if isinstance(error, (httpx.TransportError, TimeoutError)):
-            return True
-        return True
+            return error.response.status_code == 404
+        return False
 
     @staticmethod
     def _record_call(
