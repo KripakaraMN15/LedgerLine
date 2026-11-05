@@ -19,11 +19,16 @@ SUPPORTED_SCENARIOS = {
     "expensive_budget",
     "slow_tool",
     "http_429",
+    "http_429_then_ok",
     "rate_limit",
     "429",
     "http_500",
+    "http_500_then_ok",
     "server_error",
     "500",
+    "http_400",
+    "client_error",
+    "400",
     "timeout",
     "timed_out",
     "malformed_json",
@@ -75,20 +80,30 @@ async def chat_completions(
     payload: dict[str, Any],
     x_scenario: str | None = Header(default=None, alias="X-Scenario"),
     x_latency_ms: int | None = Header(default=None, alias="X-Latency-Ms"),
+    x_mock_attempt: int = Header(default=1, alias="X-Mock-Attempt"),
 ) -> Response:
     scenario = (x_scenario or "default").strip().lower().replace("-", "_")
     if scenario not in SUPPORTED_SCENARIOS:
         raise HTTPException(status_code=400, detail=f"Unknown scenario: {scenario}")
 
-    if scenario in {"http_429", "rate_limit", "429"}:
+    if scenario in {"http_429_then_ok", "429_then_ok"} and x_mock_attempt > 1:
+        scenario = "default"
+    if scenario == "http_500_then_ok" and x_mock_attempt > 1:
+        scenario = "default"
+    if scenario in {"http_429", "http_429_then_ok", "rate_limit", "429", "429_then_ok"}:
         return JSONResponse(
             status_code=429,
             content={"error": {"message": "Mock rate limit exceeded", "type": "rate_limit_error"}},
         )
-    if scenario in {"http_500", "server_error", "500"}:
+    if scenario in {"http_500", "http_500_then_ok", "server_error", "500"}:
         return JSONResponse(
             status_code=500,
             content={"error": {"message": "Mock internal server error", "type": "server_error"}},
+        )
+    if scenario in {"http_400", "client_error", "400"}:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "Mock invalid request", "type": "invalid_request_error"}},
         )
     if scenario in {"malformed_json", "malformed"}:
         return Response(content="{", status_code=200, media_type="application/json")

@@ -1,0 +1,7 @@
+models:
+  mock-llm:
+    input_per_1m_tokens: 1.0
+    output_per_1m_tokens: 2.0
+  mock-llm-cheap:
+    input_per_1m_tokens: 0.1
+    output_per_1m_tokens: 0.2
