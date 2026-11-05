@@ -35,6 +35,8 @@ class ToolResult(BaseModel):
     output: dict[str, Any] | None = None
     error: str | None = None
     latency_ms: int
+    retryable: bool = False
+    error_code: int | None = None
 
 
 class ResearchFindings(BaseModel):

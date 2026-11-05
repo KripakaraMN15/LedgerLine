@@ -76,6 +76,26 @@ def _scenario_response(scenario: str, messages: list[Any]) -> tuple[str, str]:
     return tool, json.dumps(arguments)
 
 
+def _has_successful_tool_result(messages: list[Any]) -> bool:
+    for message in messages:
+        if not (
+            isinstance(message, dict)
+            and message.get("role") == "tool"
+            and isinstance(message.get("tool_call_id"), str)
+        ):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                result = None
+            if isinstance(result, dict) and result.get("ok") is False:
+                continue
+        return True
+    return False
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -169,11 +189,8 @@ async def chat_completions(
             content={"error": {"message": "'messages' must be a list", "type": "invalid_request_error"}},
         )
 
-    completed_tool = scenario != "repeat_same_call" and any(
-        isinstance(message, dict)
-        and message.get("role") == "tool"
-        and isinstance(message.get("tool_call_id"), str)
-        for message in messages
+    completed_tool = scenario != "repeat_same_call" and _has_successful_tool_result(
+        messages
     )
     tool, arguments = _scenario_response(scenario, messages)
     prompt_tokens = _environment_int("MOCK_LLM_PROMPT_TOKENS", 128)

@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -12,7 +12,9 @@ from fastapi import FastAPI
 from mocks.mock_llm.app import app as mock_llm_app
 from mocks.mock_vendor_api.app import app as mock_vendor_app
 from mocks.shared_scenarios import SCENARIO_VENDOR_ID
-from vendorops.llm.client import BudgetExceeded, LLMClient
+from vendorops.llm.client import BudgetExceeded, LLMClient, estimate_prompt_tokens
+from vendorops.llm.cost import ModelPricing, PriceTable
+from vendorops.llm.loop import LoopDetected, ToolLoopDetector
 from vendorops.models import Budget, TaskState, TaskStatus, ToolCall, ToolResult
 from vendorops.tools import (
     ToolDefinition,
@@ -45,6 +47,51 @@ class ScriptedLLMTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         return None
+
+
+def _tool_response(call_id: str = "call-1") -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "get_vendor",
+                                "arguments": json.dumps({"vendor_id": SCENARIO_VENDOR_ID}),
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+
+def _scripted_router(
+    responses: list[dict[str, Any]],
+    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+    *,
+    prices: PriceTable | None = None,
+) -> tuple[ToolRouter, ScriptedLLMTransport, httpx.AsyncClient]:
+    transport = ScriptedLLMTransport(responses)
+    llm_http = httpx.AsyncClient(transport=transport, base_url="http://mock-llm")
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            "get_vendor",
+            "Get vendor details.",
+            GetVendorInput,
+            GetVendorOutput,
+            handler,
+        )
+    )
+    llm = LLMClient("http://mock-llm", client=llm_http, prices=prices)
+    return ToolRouter(registry, llm), transport, llm_http
 
 
 @pytest_asyncio.fixture
@@ -557,3 +604,193 @@ async def test_vendor_404_returns_tool_failure(
     assert result.ok is False
     assert result.error is not None
     assert "404" in result.error
+
+
+@pytest.mark.asyncio
+async def test_transient_tool_failure_is_repaired_on_attempt_two(
+    tool_harness: tuple[ToolRouter, TaskState, RecordingTransport, httpx.AsyncClient],
+) -> None:
+    _, state, _, _ = tool_harness
+    raw_payload = "secret-vendor-response"
+    invocations = 0
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal invocations
+        invocations += 1
+        if invocations == 1:
+            raise RuntimeError(f"temporary error included payload {raw_payload}")
+        return {
+            "id": SCENARIO_VENDOR_ID,
+            "name": "Example Vendor",
+            "status": "active",
+            "note": "",
+        }
+
+    router, transport, llm_http = _scripted_router(
+        [_tool_response("call-1"), _tool_response("call-2")],
+        handler,
+    )
+    result = await router.route(state, [{"role": "user", "content": "Get the vendor"}])
+    await llm_http.aclose()
+
+    assert result.ok is True
+    assert [call.attempt for call in state.history if isinstance(call, ToolCall)] == [1, 2]
+    assert len(transport.payloads) == 2
+    feedback = json.loads(transport.payloads[1]["messages"][-1]["content"])
+    assert "retryable" in feedback["error"]
+    assert raw_payload not in json.dumps(transport.payloads)
+
+
+@pytest.mark.asyncio
+async def test_tool_repair_exhausts_after_three_repair_attempts(
+    tool_harness: tuple[ToolRouter, TaskState, RecordingTransport, httpx.AsyncClient],
+) -> None:
+    _, state, _, _ = tool_harness
+    invocations = 0
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal invocations
+        invocations += 1
+        raise httpx.ReadTimeout("upstream timed out")
+
+    router, transport, llm_http = _scripted_router(
+        [_tool_response(f"call-{index}") for index in range(1, 5)],
+        handler,
+    )
+    result = await router.route(state, [{"role": "user", "content": "Get the vendor"}])
+    await llm_http.aclose()
+
+    assert result.ok is False
+    assert invocations == 4
+    assert len(transport.payloads) == 4
+    assert [call.attempt for call in state.history if isinstance(call, ToolCall)] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repair_calls_still_trigger_loop_detection(
+    tool_harness: tuple[ToolRouter, TaskState, RecordingTransport, httpx.AsyncClient],
+) -> None:
+    _, state, _, _ = tool_harness
+    invocations = 0
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal invocations
+        invocations += 1
+        raise httpx.ReadTimeout("upstream timed out")
+
+    router, transport, llm_http = _scripted_router(
+        [_tool_response(f"call-{index}") for index in range(1, 5)],
+        handler,
+    )
+    with pytest.raises(LoopDetected):
+        await router.route(
+            state,
+            [{"role": "user", "content": "Get the vendor"}],
+            loop_detector=ToolLoopDetector(),
+        )
+    await llm_http.aclose()
+
+    assert invocations == 2
+    assert len(transport.payloads) == 3
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_tool_error_fails_without_repair(
+    tool_harness: tuple[ToolRouter, TaskState, RecordingTransport, httpx.AsyncClient],
+) -> None:
+    _, state, _, _ = tool_harness
+    invocations = 0
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal invocations
+        invocations += 1
+        request = httpx.Request("GET", "http://mock-vendor/vendors")
+        response = httpx.Response(401, request=request, text="raw-auth-payload")
+        raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+
+    router, transport, llm_http = _scripted_router([_tool_response()], handler)
+    result = await router.route(state, [{"role": "user", "content": "Get the vendor"}])
+    await llm_http.aclose()
+
+    assert result.ok is False
+    assert invocations == 1
+    assert len(transport.payloads) == 1
+    tool_results = [item for item in state.history if isinstance(item, ToolResult)]
+    assert len(tool_results) == 1
+    assert tool_results[0].retryable is False
+
+
+@pytest.mark.asyncio
+async def test_budget_killswitch_blocks_tool_repair_call(
+    tool_harness: tuple[ToolRouter, TaskState, RecordingTransport, httpx.AsyncClient],
+) -> None:
+    _, state, _, _ = tool_harness
+    initial_messages = [{"role": "user", "content": "Get the vendor"}]
+    repair_messages = [
+        *initial_messages,
+        _tool_response()["choices"][0]["message"],
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "get_vendor",
+            "content": json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "Tool execution failed with a retryable temporary execution "
+                        "error. Correct the tool call and try again."
+                    ),
+                },
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ),
+        },
+    ]
+    prices = PriceTable(
+        {"mock-llm": ModelPricing(input_per_1m_tokens=1_000_000, output_per_1m_tokens=0)}
+    )
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        raise httpx.ReadTimeout("upstream timed out")
+
+    router, transport, llm_http = _scripted_router(
+        [_tool_response(), _tool_response("call-repair")],
+        handler,
+        prices=prices,
+    )
+    first_projection = estimate_prompt_tokens(initial_messages, router.schemas())
+    repair_projection = estimate_prompt_tokens(repair_messages, router.schemas())
+    state.budget.max_usd = (first_projection + 1 + repair_projection) / 2
+    with pytest.raises(BudgetExceeded, match="budget_exceeded"):
+        await router.route(state, initial_messages)
+    await llm_http.aclose()
+
+    assert len(transport.payloads) == 1
+    assert state.budget.steps_taken == 1
+
+
+@pytest.mark.asyncio
+async def test_step_limit_blocks_tool_repair_llm_call(
+    tool_harness: tuple[ToolRouter, TaskState, RecordingTransport, httpx.AsyncClient],
+) -> None:
+    _, state, _, _ = tool_harness
+    state.budget.max_steps = 1
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        raise httpx.ReadTimeout("upstream timed out")
+
+    router, transport, llm_http = _scripted_router(
+        [_tool_response(), _tool_response("call-repair")],
+        handler,
+    )
+    with pytest.raises(BudgetExceeded, match="step_limit"):
+        await router.route(state, [{"role": "user", "content": "Get the vendor"}])
+    await llm_http.aclose()
+
+    assert len(transport.payloads) == 1
+    assert state.budget.steps_taken == 1
