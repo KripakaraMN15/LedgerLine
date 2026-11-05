@@ -69,6 +69,7 @@ Agents exchange these objects, never raw strings.
 ```python
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 from pydantic import BaseModel, Field
 
 
@@ -92,14 +93,14 @@ class Budget(BaseModel):
 class ToolCall(BaseModel):
     id: str
     tool: str
-    args: dict
+    args: dict[str, Any]
     attempt: int = 1
 
 
 class ToolResult(BaseModel):
     call_id: str
     ok: bool
-    output: dict | None = None
+    output: dict[str, Any] | None = None
     error: str | None = None          # validation or runtime error text, fed back on retry
     latency_ms: int
 
