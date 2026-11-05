@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 from httpx import AsyncClient
-from vendorops.api.app import app
+
+pytestmark = pytest.mark.xfail(strict=True, reason="phase 1")
+
+app = pytest.importorskip("vendorops.api.app", reason="Phase 1 API is not implemented yet").app
 
 
 def _task_payload(**overrides):

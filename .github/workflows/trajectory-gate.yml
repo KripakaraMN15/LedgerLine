@@ -1,0 +1,11 @@
+name: Trajectory Gate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reserved:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder for Phase 5 trajectory replay gate
+        run: echo "Trajectory replay gate is reserved for a future Phase 5 implementation."

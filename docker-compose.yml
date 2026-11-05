@@ -1,0 +1,40 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: vendorops
+      POSTGRES_USER: vendorops
+      POSTGRES_PASSWORD: vendorops
+    ports:
+      - '5432:5432'
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - '6006:6006'
+
+  mock-llm:
+    build:
+      context: ./mocks/mock_llm
+    ports:
+      - '8001:8001'
+
+  mock-vendor:
+    build:
+      context: ./mocks/mock_vendor_api
+    ports:
+      - '8002:8002'
+
+  app:
+    build:
+      context: .
+    command: uvicorn vendorops.api.app:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - postgres
+      - phoenix
+      - mock-llm
+      - mock-vendor
+    ports:
+      - '8000:8000'
