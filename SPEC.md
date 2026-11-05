@@ -146,8 +146,8 @@ environment variables. Without an endpoint, telemetry uses the SDK's no-export s
 inject an in-memory exporter. Goals are represented by hashes and sizes, tool arguments by hashes,
 and vendor output by sizes only. Exporting is batched and network failures never block task calls;
 graceful runner shutdown performs a bounded flush. On task resume, each process run starts a new
-trace linked to the original stored trace ID, which is retained in the task row. `context.assemble`
-is defined for Phase 2 but is not wired yet.
+trace linked to the original stored trace ID, which is retained in the task row. Phase 2 wires
+`context.assemble` into every agent LLM request, including tool-validation retries.
 
 | Span | Required attributes |
 |---|---|
