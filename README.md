@@ -33,3 +33,7 @@ For Docker Compose, export a key in the shell before starting services:
 $env:VENDOROPS_API_KEY = "set-a-local-development-key"
 docker compose up --build
 ```
+
+The local Compose Phoenix service disables Phoenix authentication for the trace smoke check and
+publishes its UI and OTLP ports on loopback only. Do not reuse this development setting for a
+network-exposed Phoenix deployment.
