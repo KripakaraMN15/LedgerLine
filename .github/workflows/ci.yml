@@ -55,6 +55,13 @@ jobs:
           VENDOROPS_API_KEY: ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: docker compose build mock-llm mock-vendor
 
+      - name: Test sandbox executor
+        env:
+          REQUIRE_DOCKER: '1'
+        run: |
+          docker pull python:3.11-slim
+          pytest tests/unit/test_sandbox.py -q
+
       - name: Run tests
         run: pytest tests/unit tests/integration -q
 

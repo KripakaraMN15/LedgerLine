@@ -175,6 +175,7 @@ Never put secrets or raw PII in span attributes; log hashes instead.
 - Tools never raise into the agent loop. All failures become `ToolResult(ok=False, error=...)`.
 - Every external call has a timeout, and retries use exponential backoff with jitter.
 - Tools that move money (even mock money) must require an approved `approval_id`; the tool itself checks it, not just the agent.
+- Untrusted Python executes only in a fresh Docker container with no network or host mounts, a non-root UID, read-only root filesystem, bounded `/tmp`, CPU/memory/PID limits, capped output, and a hard timeout. The container is removed after success, failure, timeout, or cancellation.
 - Tool execution is at-least-once across crashes: side-effecting tools must derive a stable idempotency key from `ToolCall.id` and pass it to the external service. The current vendor tools are read-only.
 - Checkpoints rewrite the full messages and history JSONB state; this is acceptable for Phase 1, but payload growth must be bounded as the system scales.
 - Checkpointed messages and history can contain untrusted vendor payloads. Treat them as untrusted input and sanitize them before they are used as model instructions.
