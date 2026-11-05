@@ -174,8 +174,10 @@ class SandboxExecutor:
     async def _cleanup(self, container_name: str, process: Process) -> None:
         try:
             if process.returncode is None:
-                await self._docker_action("kill", container_name, ignore_failure=True)
-                await self._wait_for_process(process)
+                try:
+                    await self._docker_action("kill", container_name, ignore_failure=True)
+                finally:
+                    await self._wait_for_process(process)
         finally:
             await self._docker_action("rm", "-f", container_name, ignore_failure=False)
 
