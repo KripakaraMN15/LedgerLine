@@ -15,7 +15,8 @@ Fault injection can be configured at startup with the `FAIL_404`,
 settings are available from `GET /admin/faults`. `FAIL_TIMEOUT` uses an
 asynchronous delay configured by `MOCK_VENDOR_TIMEOUT_MS` (30 seconds by
 default). `RETURN_INJECTION` replaces the vendor note with an adversarial
-prompt-injection string.
+prompt-injection string. The seeded `INV-1001` amount differs from its
+`expected_amount` to support reconciliation scenarios.
 
 Run locally with `uvicorn mock_vendor_api.app:app --app-dir mocks --port 8002`
 or use the repository's Docker Compose service.
