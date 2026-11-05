@@ -401,9 +401,14 @@ class TaskRepository:
 
 
 async def apply_migrations(engine: AsyncEngine, directory: Path | None = None) -> None:
-    migration_directory = (
-        directory if directory is not None else Path(__file__).resolve().parents[3] / "migrations"
-    )
+    if directory is None:
+        source_directory = Path(__file__).resolve().parents[3] / "migrations"
+        working_directory = Path.cwd() / "migrations"
+        migration_directory = (
+            source_directory if source_directory.is_dir() else working_directory
+        )
+    else:
+        migration_directory = directory
     migration_files = sorted(migration_directory.glob("*.sql"))
     if not migration_files:
         raise FileNotFoundError(f"No SQL migrations found in {migration_directory}")
