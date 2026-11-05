@@ -15,9 +15,11 @@ Supported scenarios:
 - `slow_tool`: waits for `MOCK_LLM_SLOW_MS` (5 seconds by default).
 - `http_429`, `http_500`, `http_429_then_ok`, and `http_500_then_ok`: simulate
   rate-limit and server failures (the `_then_ok` variants succeed after the
-  first request attempt).
-- `http_400`, `timeout`, and `malformed_json`: simulate corresponding failure
-  modes.
+  first request attempt). `http_429_with_usage_then_ok` includes token usage
+  on its failed response to exercise retry cost accounting;
+  `http_429_retry_after_then_ok` includes a `Retry-After` header.
+- `http_400`, `http_401`, `http_404`, `timeout`, and `malformed_json`: simulate
+  corresponding failure modes.
 
 Latency and token counts can be configured with
 `MOCK_LLM_LATENCY_MIN_MS`, `MOCK_LLM_LATENCY_MAX_MS`,

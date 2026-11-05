@@ -20,6 +20,8 @@ SUPPORTED_SCENARIOS = {
     "slow_tool",
     "http_429",
     "http_429_then_ok",
+    "http_429_with_usage_then_ok",
+    "http_429_retry_after_then_ok",
     "rate_limit",
     "429",
     "http_500",
@@ -29,6 +31,8 @@ SUPPORTED_SCENARIOS = {
     "http_400",
     "client_error",
     "400",
+    "http_401",
+    "http_404",
     "timeout",
     "timed_out",
     "malformed_json",
@@ -86,14 +90,33 @@ async def chat_completions(
     if scenario not in SUPPORTED_SCENARIOS:
         raise HTTPException(status_code=400, detail=f"Unknown scenario: {scenario}")
 
-    if scenario in {"http_429_then_ok", "429_then_ok"} and x_mock_attempt > 1:
+    if scenario in {
+        "http_429_then_ok",
+        "http_429_with_usage_then_ok",
+        "http_429_retry_after_then_ok",
+        "429_then_ok",
+    } and x_mock_attempt > 1:
         scenario = "default"
     if scenario == "http_500_then_ok" and x_mock_attempt > 1:
         scenario = "default"
-    if scenario in {"http_429", "http_429_then_ok", "rate_limit", "429", "429_then_ok"}:
+    if scenario in {
+        "http_429",
+        "http_429_then_ok",
+        "http_429_with_usage_then_ok",
+        "http_429_retry_after_then_ok",
+        "rate_limit",
+        "429",
+        "429_then_ok",
+    }:
+        content: dict[str, Any] = {
+            "error": {"message": "Mock rate limit exceeded", "type": "rate_limit_error"}
+        }
+        if scenario == "http_429_with_usage_then_ok":
+            content["usage"] = {"prompt_tokens": 128, "completion_tokens": 32}
         return JSONResponse(
             status_code=429,
-            content={"error": {"message": "Mock rate limit exceeded", "type": "rate_limit_error"}},
+            content=content,
+            headers={"Retry-After": "3"} if scenario == "http_429_retry_after_then_ok" else None,
         )
     if scenario in {"http_500", "http_500_then_ok", "server_error", "500"}:
         return JSONResponse(
@@ -104,6 +127,16 @@ async def chat_completions(
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "Mock invalid request", "type": "invalid_request_error"}},
+        )
+    if scenario == "http_401":
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"message": "Mock unauthorized", "type": "authentication_error"}},
+        )
+    if scenario == "http_404":
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": "Mock resource not found", "type": "not_found_error"}},
         )
     if scenario in {"malformed_json", "malformed"}:
         return Response(content="{", status_code=200, media_type="application/json")
