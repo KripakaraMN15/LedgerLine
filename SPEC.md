@@ -60,7 +60,7 @@ Rules:
 - `DONE`, `FAILED`, `KILLED`, `CANCELLED` are terminal.
 - Every transition writes a row to `task_events` (task_id, from, to, reason, timestamp) in the same DB transaction as the state change.
 - Task creation is idempotent: clients send an `idempotency_key`; a duplicate key returns the existing task.
-- On process restart, tasks left in `RUNNING` are resumed from their last checkpoint or marked `FAILED` with reason `orphaned`.
+- On process restart, every `CREATED` task is enqueued (it may have been inserted just before a crash); stale `RUNNING` tasks are resumed from their last checkpoint or marked `FAILED` with reason `orphaned`.
 - Phase 1 runs a single app instance. Stale-task recovery uses a five-minute threshold and checkpoints refresh `updated_at`; multiple replicas require a recovery lease or `FOR UPDATE SKIP LOCKED`.
 
 ## 4. Typed state (src/vendorops/models.py)

@@ -27,6 +27,11 @@ services:
       dockerfile: mocks/mock_llm/Dockerfile
     ports:
       - '8001:8001'
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
 
   mock-vendor:
     build:
@@ -34,19 +39,32 @@ services:
       dockerfile: mocks/mock_vendor_api/Dockerfile
     ports:
       - '8002:8002'
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
 
   app:
     build:
       context: .
     command: uvicorn vendorops.api.app:app --host 0.0.0.0 --port 8000
     environment:
+      DATABASE_URL: postgresql+asyncpg://vendorops:vendorops@postgres:5432/vendorops
+      VENDOROPS_API_KEY: ${VENDOROPS_API_KEY:?Set VENDOROPS_API_KEY before starting the API}
+      LLM_BASE_URL: http://mock-llm:8001
+      VENDOR_API_BASE_URL: http://mock-vendor:8002
       OTEL_SERVICE_NAME: vendorops
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://phoenix:6006/v1/traces
     depends_on:
-      - postgres
-      - phoenix
-      - mock-llm
-      - mock-vendor
+      postgres:
+        condition: service_healthy
+      phoenix:
+        condition: service_started
+      mock-llm:
+        condition: service_healthy
+      mock-vendor:
+        condition: service_healthy
     ports:
       - '8000:8000'

@@ -138,6 +138,22 @@ async def test_running_task_recovery_query_filters_by_staleness(
 
 
 @pytest.mark.asyncio
+async def test_recoverable_query_includes_stale_created_tasks(
+    repository: TaskRepository,
+) -> None:
+    task = await repository.create_task(
+        idempotency_key=f"created-recovery-{uuid4()}",
+        goal="Recover an inserted task whose process died before enqueue",
+    )
+
+    stale_tasks = await repository.find_recoverable_tasks(
+        datetime.now(UTC) - timedelta(days=1)
+    )
+
+    assert task.id in {stale_task.id for stale_task in stale_tasks}
+
+
+@pytest.mark.asyncio
 async def test_one_hundred_tasks_complete_under_ten_seconds_with_postgres(
     repository: TaskRepository,
 ) -> None:
