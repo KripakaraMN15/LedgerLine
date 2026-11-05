@@ -103,6 +103,7 @@ class SandboxExecutor:
                 "no-new-privileges:true",
                 "--workdir",
                 "/tmp",
+                "--interactive",
                 self._image,
                 "python",
                 "-I",
