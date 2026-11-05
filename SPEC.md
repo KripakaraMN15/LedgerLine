@@ -61,6 +61,7 @@ Rules:
 - Every transition writes a row to `task_events` (task_id, from, to, reason, timestamp) in the same DB transaction as the state change.
 - Task creation is idempotent: clients send an `idempotency_key`; a duplicate key returns the existing task.
 - On process restart, tasks left in `RUNNING` are resumed from their last checkpoint or marked `FAILED` with reason `orphaned`.
+- Phase 1 runs a single app instance. Stale-task recovery uses a five-minute threshold and checkpoints refresh `updated_at`; multiple replicas require a recovery lease or `FOR UPDATE SKIP LOCKED`.
 
 ## 4. Typed state (src/vendorops/models.py)
 
@@ -165,6 +166,9 @@ Never put secrets or raw PII in span attributes; log hashes instead.
 - Tools never raise into the agent loop. All failures become `ToolResult(ok=False, error=...)`.
 - Every external call has a timeout, and retries use exponential backoff with jitter.
 - Tools that move money (even mock money) must require an approved `approval_id`; the tool itself checks it, not just the agent.
+- Tool execution is at-least-once across crashes: side-effecting tools must derive a stable idempotency key from `ToolCall.id` and pass it to the external service. The current vendor tools are read-only.
+- Checkpoints rewrite the full messages and history JSONB state; this is acceptable for Phase 1, but payload growth must be bounded as the system scales.
+- Checkpointed messages and history can contain untrusted vendor payloads. Treat them as untrusted input and sanitize them before they are used as model instructions.
 
 ## 8. Mock services
 

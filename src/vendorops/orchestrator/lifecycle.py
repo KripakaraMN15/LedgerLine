@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from vendorops.models import TaskStatus
 
@@ -275,6 +275,28 @@ class TaskRepository:
             )
             return _task_from_row(updated_row)
 
+    async def checkpoint_task_state(
+        self, task_id: UUID | str, state: dict[str, Any]
+    ) -> TaskRecord:
+        parsed_id = UUID(str(task_id))
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                text(
+                    """
+                    UPDATE tasks
+                    SET state = CAST(:state AS jsonb), updated_at = now()
+                    WHERE id = :id
+                    RETURNING id, idempotency_key, goal, status, state,
+                              trace_id, created_at, updated_at
+                    """
+                ),
+                {"id": parsed_id, "state": json.dumps(state)},
+            )
+            row = result.mappings().one_or_none()
+        if row is None:
+            raise TaskNotFound(parsed_id)
+        return _task_from_row(row)
+
     async def find_running_tasks(self, stale_before: datetime) -> list[TaskRecord]:
         async with self._engine.connect() as connection:
             result = await connection.execute(
@@ -336,3 +358,19 @@ async def apply_migrations(engine: AsyncEngine, directory: Path | None = None) -
             for statement in statements:
                 if statement:
                     await connection.exec_driver_sql(statement)
+
+
+def create_task_engine(
+    database_url: str,
+    *,
+    pool_size: int = 10,
+    max_overflow: int = 10,
+) -> AsyncEngine:
+    if pool_size < 1 or max_overflow < 0:
+        raise ValueError("pool_size must be positive and max_overflow must be non-negative")
+    return create_async_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+    )
