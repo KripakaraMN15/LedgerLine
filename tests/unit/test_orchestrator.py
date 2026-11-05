@@ -74,6 +74,12 @@ class MemoryRepository:
         except KeyError as error:
             raise TaskNotFound(parsed_id) from error
 
+    async def set_trace_id(self, task_id: UUID | str, trace_id: str) -> TaskRecord:
+        record = await self.get_task(task_id)
+        updated = replace(record, trace_id=record.trace_id or trace_id)
+        self.records[record.id] = updated
+        return updated
+
     async def checkpoint_task_state(
         self,
         task_id: UUID | str,

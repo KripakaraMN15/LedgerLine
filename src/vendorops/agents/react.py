@@ -5,6 +5,7 @@ from typing import Any, Protocol
 from vendorops.llm.client import LLMClient
 from vendorops.llm.loop import ToolLoopDetector
 from vendorops.models import TaskState
+from vendorops.telemetry import span
 from vendorops.tools.router import ToolRouter
 
 
@@ -39,6 +40,13 @@ class ReactAgent:
         self._max_iterations = max_iterations
 
     async def run(self, state: TaskState) -> TaskState:
+        with span("agent.react", {"iteration_limit": self._max_iterations}) as current_span:
+            result = await self._run(state)
+            current_span.set_attribute("iterations", state.budget.steps_taken)
+            current_span.set_attribute("final_answer_size", len(state.final_answer or ""))
+            return result
+
+    async def _run(self, state: TaskState) -> TaskState:
         if state.final_answer is not None:
             return state
         if not state.messages:

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from vendorops.llm.client import BudgetExceeded, LLMClient
 from vendorops.llm.loop import LoopDetected, ToolLoopDetector
 from vendorops.models import TaskState, ToolCall, ToolResult
+from vendorops.telemetry import set_span_error, tool_call_span
 from vendorops.tools.registry import ToolRegistry
 
 MAX_VALIDATION_FEEDBACK_CHARS = 500
@@ -107,12 +108,22 @@ class ToolRouter:
 
             tool = self._registry.get(tool_name)
             if tool is None:
+                with tool_call_span(tool_name, arguments, attempt) as current_span:
+                    current_span.set_attribute("ok", False)
+                    current_span.set_attribute("latency_ms", 0)
+                    current_span.set_attribute("error", "UnknownTool")
+                    set_span_error(current_span, "UnknownTool")
                 self._record_call(state, call_id, tool_name, arguments, attempt)
                 return self._failure(state, call_id, f"Unknown tool: {tool_name}", 0)
 
             try:
                 tool.input_model.model_validate(arguments)
             except ValidationError as error:
+                with tool_call_span(tool_name, arguments, attempt) as current_span:
+                    current_span.set_attribute("ok", False)
+                    current_span.set_attribute("latency_ms", 0)
+                    current_span.set_attribute("error", "ValidationError")
+                    set_span_error(current_span, "ValidationError")
                 self._record_call(state, call_id, tool_name, arguments, attempt)
                 error_text = self._validation_feedback(error)
                 if attempt > self._max_tool_retries:
@@ -129,7 +140,15 @@ class ToolRouter:
 
             self._record_call(state, call_id, tool_name, arguments, attempt)
             if loop_detector is not None:
-                loop_detector.observe(tool_name, arguments)
+                try:
+                    loop_detector.observe(tool_name, arguments)
+                except LoopDetected as error:
+                    with tool_call_span(tool_name, arguments, attempt) as current_span:
+                        current_span.set_attribute("ok", False)
+                        current_span.set_attribute("latency_ms", 0)
+                        current_span.set_attribute("error", type(error).__name__)
+                        set_span_error(current_span, type(error).__name__)
+                    raise
             tool_call = ToolCall(
                 id=call_id,
                 tool=tool_name,
@@ -154,24 +173,46 @@ class ToolRouter:
         messages: list[dict[str, Any]],
         checkpoint: Checkpoint | None = None,
     ) -> ToolResult:
-        try:
-            async with asyncio.timeout(self._total_timeout):
-                return await self._execute_pending(
+        started = time.perf_counter()
+        with tool_call_span(tool_call.tool, tool_call.args, tool_call.attempt) as current_span:
+            try:
+                async with asyncio.timeout(self._total_timeout):
+                    result = await self._execute_pending(
+                        state,
+                        tool_call,
+                        messages=messages,
+                        checkpoint=checkpoint,
+                    )
+            except asyncio.CancelledError:
+                current_span.set_attribute("cancelled", True)
+                current_span.set_attribute("latency_ms", self._latency_ms(started))
+                raise
+            except TimeoutError:
+                state.pending_tool_call = None
+                result = self._failure(
                     state,
-                    tool_call,
-                    messages=messages,
-                    checkpoint=checkpoint,
+                    tool_call.id,
+                    f"Tool call exceeded {self._total_timeout:g}s time limit",
+                    int(self._total_timeout * 1000),
                 )
-        except TimeoutError:
-            state.pending_tool_call = None
-            result = self._failure(
-                state,
-                tool_call.id,
-                f"Tool call exceeded {self._total_timeout:g}s time limit",
-                int(self._total_timeout * 1000),
-            )
-            if checkpoint is not None:
-                await checkpoint()
+                if checkpoint is not None:
+                    await checkpoint()
+            current_span.set_attribute("ok", result.ok)
+            current_span.set_attribute("latency_ms", self._latency_ms(started))
+            if result.ok:
+                current_span.set_attribute(
+                    "output_size",
+                    len(
+                        json.dumps(
+                            result.output,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ),
+                )
+            elif result.error:
+                current_span.set_attribute("error", "ToolExecutionError")
+                set_span_error(current_span, "ToolExecutionError")
             return result
 
     async def _execute_pending(

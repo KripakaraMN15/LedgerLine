@@ -108,6 +108,19 @@ async def test_task_checkpoint_updates_state_without_a_status_transition(
 
 
 @pytest.mark.asyncio
+async def test_task_trace_id_is_persisted(repository: TaskRepository) -> None:
+    task = await repository.create_task(
+        idempotency_key=f"trace-id-{uuid4()}",
+        goal="Persist trace context",
+    )
+
+    updated = await repository.set_trace_id(task.id, "0a" * 16)
+
+    assert updated.trace_id == "0a" * 16
+    assert (await repository.get_task(task.id)).trace_id == "0a" * 16
+
+
+@pytest.mark.asyncio
 async def test_running_task_recovery_query_filters_by_staleness(
     repository: TaskRepository,
 ) -> None:

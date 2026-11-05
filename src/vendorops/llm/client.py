@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import random
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ import httpx
 
 from vendorops.llm.cost import PriceTable, load_price_table
 from vendorops.models import TaskState
+from vendorops.telemetry import killswitch_check_span, llm_call_span
 
 
 class BudgetExceeded(Exception):
@@ -144,9 +146,80 @@ class LLMClient:
         estimated_prompt_tokens: int | None = None,
         estimated_completion_tokens: int | None = None,
     ) -> LLMCompletion:
+        prompt_tokens = (
+            estimated_prompt_tokens
+            if estimated_prompt_tokens is not None
+            else estimate_prompt_tokens(messages, tools)
+        )
+        completion_tokens = (
+            estimated_completion_tokens
+            if estimated_completion_tokens is not None
+            else max_tokens
+        )
+        initial_spend = state.budget.spent_usd
+        started = time.perf_counter()
+        attempts = 1
+        selected_model = model
+        with llm_call_span(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        ) as current_span:
+            try:
+                completion = await self._complete(
+                    state,
+                    messages,
+                    model=model,
+                    fallback_model=fallback_model,
+                    fallback_on_budget=fallback_on_budget,
+                    headers=headers,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    estimated_completion_tokens=estimated_completion_tokens,
+                )
+                attempts = completion.attempts
+                selected_model = completion.model
+                usage = completion.response.get("usage")
+                if isinstance(usage, Mapping):
+                    prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
+                    completion_tokens = int(
+                        usage.get("completion_tokens", completion_tokens)
+                    )
+                current_span.set_attribute("usd", completion.cost_usd)
+                return completion
+            except Exception as error:
+                attempts = error.attempts if isinstance(error, LLMAPIError) else 1
+                current_span.set_attribute("error", type(error).__name__)
+                raise
+            finally:
+                current_span.set_attribute("model", selected_model)
+                current_span.set_attribute("prompt_tokens", prompt_tokens)
+                current_span.set_attribute("completion_tokens", completion_tokens)
+                current_span.set_attribute("usd", state.budget.spent_usd - initial_spend)
+                current_span.set_attribute("latency_ms", round((time.perf_counter() - started) * 1000))
+                current_span.set_attribute("attempt", attempts)
+
+    async def _complete(
+        self,
+        state: TaskState,
+        messages: list[dict[str, Any]],
+        *,
+        model: str = "mock-llm",
+        fallback_model: str | None = None,
+        fallback_on_budget: bool = False,
+        headers: Mapping[str, str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 128,
+        estimated_prompt_tokens: int | None = None,
+        estimated_completion_tokens: int | None = None,
+    ) -> LLMCompletion:
         budget = state.budget
         if budget.steps_taken >= budget.max_steps:
-            raise BudgetExceeded(budget.spent_usd, budget.max_usd, "step_limit")
+            with killswitch_check_span(
+                budget.spent_usd, budget.max_usd, tripped=True
+            ):
+                raise BudgetExceeded(budget.spent_usd, budget.max_usd, "step_limit")
 
         prompt_tokens = (
             estimated_prompt_tokens
@@ -169,11 +242,19 @@ class LLMClient:
 
         for attempt in range(1, self._max_attempts + 1):
             if budget.steps_taken >= budget.max_steps:
-                raise BudgetExceeded(budget.spent_usd, budget.max_usd, "step_limit")
+                with killswitch_check_span(
+                    budget.spent_usd, budget.max_usd, tripped=True
+                ):
+                    raise BudgetExceeded(budget.spent_usd, budget.max_usd, "step_limit")
             projected = budget.spent_usd + self._prices.estimate(
                 selected_model, prompt_tokens, completion_tokens
             )
-            if projected > budget.max_usd:
+            over_budget = projected > budget.max_usd
+            with killswitch_check_span(
+                projected, budget.max_usd, tripped=over_budget
+            ):
+                pass
+            if over_budget:
                 primary_cost = self._prices.estimate(model, prompt_tokens, completion_tokens)
                 fallback_cost = (
                     self._prices.estimate(fallback_model, prompt_tokens, completion_tokens)

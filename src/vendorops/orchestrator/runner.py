@@ -5,11 +5,14 @@ from datetime import UTC, datetime, timedelta
 from types import FrameType
 from uuid import UUID
 
+from opentelemetry.trace import Span
+
 from vendorops.agents.react import ReactAgent
 from vendorops.llm.client import BudgetExceeded
 from vendorops.llm.loop import LoopDetected
 from vendorops.models import Budget, TaskState, TaskStatus
 from vendorops.orchestrator.lifecycle import TaskRecord, TaskRepository
+from vendorops.telemetry import flush_tracing, set_span_error, task_span
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +73,16 @@ class TaskRunner:
     async def shutdown(self) -> None:
         self._accepting = False
         active = tuple(self._tasks.values())
-        if not active:
-            return
-        _, pending = await asyncio.wait(active, timeout=self._shutdown_timeout)
-        if pending:
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+        if active:
+            _, pending = await asyncio.wait(active, timeout=self._shutdown_timeout)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+        try:
+            await asyncio.wait_for(asyncio.to_thread(flush_tracing, 1500), timeout=2.0)
+        except Exception:
+            logger.exception("Could not flush task telemetry during shutdown")
 
     async def recover_stale(self, stale_before: datetime | None = None) -> int:
         if stale_before is None:
@@ -142,7 +148,6 @@ class TaskRunner:
 
     async def _run_one(self, task_id: str) -> TaskRecord | None:
         async with self._semaphore:
-            state: TaskState | None = None
             try:
                 record = await self._repository.get_task(task_id)
                 if record.status in {
@@ -152,42 +157,83 @@ class TaskRunner:
                     TaskStatus.CANCELLED,
                 }:
                     return record
-                state = self._state_from_record(record)
-                if record.status is TaskStatus.CREATED:
-                    state.status = TaskStatus.RUNNING
-                    record = await self._repository.transition_task(
-                        record.id,
-                        TaskStatus.RUNNING,
-                        "started",
-                        state=state.model_dump(mode="json"),
-                    )
-                state.status = TaskStatus.RUNNING
-                await self._agent.run(state)
-                state.status = TaskStatus.DONE
-                return await self._repository.transition_task(
-                    record.id,
-                    TaskStatus.DONE,
-                    "completed",
-                    state=state.model_dump(mode="json"),
-                )
+                with task_span(
+                    task_id, record.goal, linked_trace_id=record.trace_id
+                ) as current_span:
+                    if record.trace_id is None:
+                        trace_id = f"{current_span.get_span_context().trace_id:032x}"
+                        record = await self._repository.set_trace_id(record.id, trace_id)
+                    return await self._run_record(record, current_span)
             except asyncio.CancelledError:
                 raise
-            except BudgetExceeded as error:
-                return await self._finish(task_id, state, TaskStatus.KILLED, error.reason)
-            except LoopDetected:
-                return await self._finish(task_id, state, TaskStatus.KILLED, "loop_detected")
             except Exception as error:
                 logger.exception("Task execution failed", extra={"task_id": task_id})
-                return await self._finish(
-                    task_id,
-                    state,
-                    TaskStatus.FAILED,
-                    str(error) or type(error).__name__,
+                return await self._finish(task_id, None, TaskStatus.FAILED, type(error).__name__)
+
+    async def _run_record(self, record: TaskRecord, current_span: Span) -> TaskRecord | None:
+        state: TaskState | None = None
+        try:
+            state = self._state_from_record(record)
+            if record.status is TaskStatus.CREATED:
+                state.status = TaskStatus.RUNNING
+                record = await self._repository.transition_task(
+                    record.id,
+                    TaskStatus.RUNNING,
+                    "started",
+                    state=state.model_dump(mode="json"),
                 )
+            state.status = TaskStatus.RUNNING
+            await self._agent.run(state)
+            state.status = TaskStatus.DONE
+            result = await self._repository.transition_task(
+                record.id,
+                TaskStatus.DONE,
+                "completed",
+                state=state.model_dump(mode="json"),
+            )
+            self._set_task_outcome(current_span, TaskStatus.DONE, "completed", state)
+            return result
+        except asyncio.CancelledError:
+            raise
+        except BudgetExceeded as error:
+            finished_record = await self._finish(
+                str(record.id), state, TaskStatus.KILLED, error.reason
+            )
+            set_span_error(current_span, type(error).__name__)
+            self._set_task_outcome(current_span, TaskStatus.KILLED, error.reason, state)
+            return finished_record
+        except LoopDetected as error:
+            finished_record = await self._finish(
+                str(record.id), state, TaskStatus.KILLED, "loop_detected"
+            )
+            set_span_error(current_span, type(error).__name__)
+            self._set_task_outcome(current_span, TaskStatus.KILLED, "loop_detected", state)
+            return finished_record
+        except Exception as error:
+            logger.exception("Task execution failed", extra={"task_id": str(record.id)})
+            reason = type(error).__name__
+            finished_record = await self._finish(
+                str(record.id), state, TaskStatus.FAILED, reason
+            )
+            set_span_error(current_span, reason)
+            self._set_task_outcome(current_span, TaskStatus.FAILED, reason, state)
+            return finished_record
+
+    @staticmethod
+    def _set_task_outcome(
+        current_span: Span,
+        status: TaskStatus,
+        reason: str,
+        state: TaskState | None,
+    ) -> None:
+        current_span.set_attribute("final_status", status.value)
+        current_span.set_attribute("reason", reason)
+        current_span.set_attribute("total_usd", state.budget.spent_usd if state else 0.0)
+        current_span.set_attribute("total_steps", state.budget.steps_taken if state else 0)
 
     async def _finish(
         self,
-        task_id: str,
+        task_id: UUID | str,
         state: TaskState | None,
         status: TaskStatus,
         reason: str,

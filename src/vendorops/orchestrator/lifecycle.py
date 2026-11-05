@@ -11,6 +11,7 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from vendorops.models import TaskStatus
+from vendorops.telemetry import state_transition_span
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,32 @@ class TaskRepository:
             raise TaskNotFound(parsed_id)
         return _task_from_row(row)
 
+    async def set_trace_id(self, task_id: UUID | str, trace_id: str) -> TaskRecord:
+        parsed_id = UUID(str(task_id))
+        if len(trace_id) != 32:
+            raise ValueError("trace_id must be a 32-character hexadecimal identifier")
+        try:
+            int(trace_id, 16)
+        except ValueError as error:
+            raise ValueError("trace_id must be hexadecimal") from error
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                text(
+                    """
+                    UPDATE tasks
+                    SET trace_id = COALESCE(trace_id, :trace_id), updated_at = now()
+                    WHERE id = :id
+                    RETURNING id, idempotency_key, goal, status, state,
+                              trace_id, created_at, updated_at
+                    """
+                ),
+                {"id": parsed_id, "trace_id": trace_id},
+            )
+            row = result.mappings().one_or_none()
+        if row is None:
+            raise TaskNotFound(parsed_id)
+        return _task_from_row(row)
+
     async def transition_task(
         self,
         task_id: UUID | str,
@@ -235,44 +262,45 @@ class TaskRepository:
             current = _task_from_row(current_row)
             validate_transition(current.status, target)
 
-            state_update = ""
-            parameters: dict[str, Any] = {
-                "id": parsed_id,
-                "status": target.value,
-            }
-            if state is not None:
-                state_update = ", state = CAST(:state AS jsonb)"
-                parameters["state"] = json.dumps(state)
+            with state_transition_span(current.status.value, target.value, reason):
+                state_update = ""
+                parameters: dict[str, Any] = {
+                    "id": parsed_id,
+                    "status": target.value,
+                }
+                if state is not None:
+                    state_update = ", state = CAST(:state AS jsonb)"
+                    parameters["state"] = json.dumps(state)
 
-            result = await connection.execute(
-                text(
-                    f"""
-                    UPDATE tasks
-                    SET status = :status, updated_at = now(){state_update}
-                    WHERE id = :id
-                    RETURNING id, idempotency_key, goal, status, state,
-                              trace_id, created_at, updated_at
-                    """
-                ),
-                parameters,
-            )
-            updated_row = result.mappings().one()
-            await connection.execute(
-                text(
-                    """
-                    INSERT INTO task_events (
-                        task_id, from_status, to_status, reason
-                    )
-                    VALUES (:task_id, :from_status, :to_status, :reason)
-                    """
-                ),
-                {
-                    "task_id": parsed_id,
-                    "from_status": current.status.value,
-                    "to_status": target.value,
-                    "reason": reason,
-                },
-            )
+                result = await connection.execute(
+                    text(
+                        f"""
+                        UPDATE tasks
+                        SET status = :status, updated_at = now(){state_update}
+                        WHERE id = :id
+                        RETURNING id, idempotency_key, goal, status, state,
+                                  trace_id, created_at, updated_at
+                        """
+                    ),
+                    parameters,
+                )
+                updated_row = result.mappings().one()
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO task_events (
+                            task_id, from_status, to_status, reason
+                        )
+                        VALUES (:task_id, :from_status, :to_status, :reason)
+                        """
+                    ),
+                    {
+                        "task_id": parsed_id,
+                        "from_status": current.status.value,
+                        "to_status": target.value,
+                        "reason": reason,
+                    },
+                )
             return _task_from_row(updated_row)
 
     async def checkpoint_task_state(
