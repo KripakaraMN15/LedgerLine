@@ -16,6 +16,8 @@ from vendorops.orchestrator.lifecycle import TaskRepository, apply_migrations
 async def repository() -> AsyncIterator[TaskRepository]:
     database_url = os.environ.get("TEST_DATABASE_URL")
     if not database_url:
+        if os.environ.get("REQUIRE_DB") == "1":
+            pytest.fail("REQUIRE_DB=1 but TEST_DATABASE_URL is not configured")
         pytest.skip("Set TEST_DATABASE_URL to run PostgreSQL lifecycle integration tests")
     engine: AsyncEngine = create_async_engine(database_url, pool_pre_ping=True)
     await apply_migrations(engine)
@@ -44,6 +46,12 @@ async def test_concurrent_idempotent_inserts_return_one_task(
     stored = await repository.get_task(records[0].id)
     assert stored.idempotency_key == idempotency_key
     assert stored.status is TaskStatus.CREATED
+    assert await repository.count_tasks_by_idempotency_key(idempotency_key) == 1
+    events = await repository.list_task_events(stored.id)
+    assert len(events) == 1
+    assert events[0].from_status is TaskStatus.CREATED
+    assert events[0].to_status is TaskStatus.CREATED
+    assert events[0].reason == "created"
 
 
 @pytest.mark.asyncio
@@ -61,6 +69,7 @@ async def test_state_transition_and_event_are_persisted_together(
 
     assert done.status is TaskStatus.DONE
     assert [(event.from_status, event.to_status) for event in events] == [
+        (TaskStatus.CREATED, TaskStatus.CREATED),
         (TaskStatus.CREATED, TaskStatus.RUNNING),
         (TaskStatus.RUNNING, TaskStatus.DONE),
     ]

@@ -5,7 +5,18 @@ from httpx import AsyncClient
 
 pytestmark = pytest.mark.xfail(strict=True, reason="phase 1")
 
-app = pytest.importorskip("vendorops.api.app", reason="Phase 1 API is not implemented yet").app
+try:
+    from vendorops.api.app import app
+except ModuleNotFoundError as error:
+    if error.name != "vendorops.api.app":
+        raise
+    app = None
+
+
+def _phase1_app():
+    if app is None:
+        pytest.xfail("Phase 1 API is not implemented yet")
+    return app
 
 
 def _task_payload(**overrides):
@@ -33,7 +44,7 @@ async def _wait_for_status(client: AsyncClient, task_id: str, target_status: str
 
 @pytest.mark.asyncio
 async def test_happy_path_task_reaches_done_and_records_transition_history():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post("/tasks", json=_task_payload())
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]
@@ -44,7 +55,7 @@ async def test_happy_path_task_reaches_done_and_records_transition_history():
 
 @pytest.mark.asyncio
 async def test_concurrency_100_tasks_finish_within_10_seconds():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         started = asyncio.get_running_loop().time()
         tasks = [
             client.post("/tasks", json=_task_payload(goal=f"Submit vendor task {index}", idempotency_key=f"concurrency-{index}"))
@@ -60,7 +71,7 @@ async def test_concurrency_100_tasks_finish_within_10_seconds():
 
 @pytest.mark.asyncio
 async def test_slow_tool_call_does_not_block_other_tasks():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         slow_response = await client.post("/tasks", json=_task_payload(goal="Slow task", scenario="slow_tool", idempotency_key="slow-tool"))
         assert slow_response.status_code == 202
         slow_id = slow_response.json()["task_id"]
@@ -78,7 +89,7 @@ async def test_slow_tool_call_does_not_block_other_tasks():
 
 @pytest.mark.asyncio
 async def test_bad_params_retry_uses_validation_error_text_in_retry_prompt():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post("/tasks", json=_task_payload(goal="Trigger bad params", scenario="bad_params_then_ok", idempotency_key="bad-params"))
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]
@@ -90,7 +101,7 @@ async def test_bad_params_retry_uses_validation_error_text_in_retry_prompt():
 
 @pytest.mark.asyncio
 async def test_retry_exhaustion_returns_failed_task_not_hung():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post("/tasks", json=_task_payload(goal="Always bad params", scenario="always_bad_params", idempotency_key="always-bad"))
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]
@@ -101,7 +112,7 @@ async def test_retry_exhaustion_returns_failed_task_not_hung():
 
 @pytest.mark.asyncio
 async def test_budget_kill_switch_marks_task_killed_with_budget_exceeded_reason():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post(
             "/tasks",
             json=_task_payload(goal="Expensive scenario", scenario="expensive_budget", max_usd=0.01, idempotency_key="budget-kill"),
@@ -115,7 +126,7 @@ async def test_budget_kill_switch_marks_task_killed_with_budget_exceeded_reason(
 
 @pytest.mark.asyncio
 async def test_loop_detection_kills_task_after_three_repeated_calls():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post(
             "/tasks",
             json=_task_payload(goal="Repeat same call", scenario="repeat_same_call", idempotency_key="loop-detect"),
@@ -129,7 +140,7 @@ async def test_loop_detection_kills_task_after_three_repeated_calls():
 
 @pytest.mark.asyncio
 async def test_idempotent_requests_return_same_task_id_and_create_one_task_record():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         payload = _task_payload(goal="Idempotent run", idempotency_key="duplicate-key")
         first = await client.post("/tasks", json=payload)
         second = await client.post("/tasks", json=payload)
@@ -141,7 +152,7 @@ async def test_idempotent_requests_return_same_task_id_and_create_one_task_recor
 
 @pytest.mark.asyncio
 async def test_restart_recovery_never_leaves_task_stuck_in_running_state():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post("/tasks", json=_task_payload(goal="Restart scenario", scenario="orphan_then_resume", idempotency_key="restart-key"))
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]
@@ -155,7 +166,7 @@ async def test_restart_recovery_never_leaves_task_stuck_in_running_state():
 
 @pytest.mark.asyncio
 async def test_completed_task_contains_one_trace_with_required_spans_and_attributes():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post("/tasks", json=_task_payload(goal="Tracing scenario", scenario="happy_path", idempotency_key="trace-key"))
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]
@@ -168,7 +179,7 @@ async def test_completed_task_contains_one_trace_with_required_spans_and_attribu
 
 @pytest.mark.asyncio
 async def test_sigterm_allows_inflight_tasks_to_reach_checkpoint_before_exit():
-    async with AsyncClient(app=app, base_url="http://testserver") as client:
+    async with AsyncClient(app=_phase1_app(), base_url="http://testserver") as client:
         response = await client.post("/tasks", json=_task_payload(goal="Graceful shutdown", scenario="slow_tool", idempotency_key="shutdown-key"))
         assert response.status_code == 202, response.text
         task_id = response.json()["task_id"]

@@ -153,6 +153,7 @@ class TaskRepository:
                 },
             )
             row = result.mappings().one_or_none()
+            was_created = row is not None
             if row is None:
                 result = await connection.execute(
                     text(
@@ -168,6 +169,20 @@ class TaskRepository:
                 row = result.mappings().one_or_none()
             if row is None:
                 raise RuntimeError("Idempotent task insert produced no task row")
+            if was_created:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO task_events (
+                            task_id, from_status, to_status, reason
+                        )
+                        VALUES (
+                            :task_id, :status, :status, 'created'
+                        )
+                        """
+                    ),
+                    {"task_id": row["id"], "status": TaskStatus.CREATED.value},
+                )
             return _task_from_row(row)
 
     async def get_task(self, task_id: UUID | str) -> TaskRecord:
@@ -296,6 +311,15 @@ class TaskRepository:
             )
             rows = result.mappings().all()
         return [_event_from_row(row) for row in rows]
+
+    async def count_tasks_by_idempotency_key(self, idempotency_key: str) -> int:
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                text("SELECT count(*) FROM tasks WHERE idempotency_key = :idempotency_key"),
+                {"idempotency_key": idempotency_key},
+            )
+            count = result.scalar_one()
+        return int(count)
 
 
 async def apply_migrations(engine: AsyncEngine, directory: Path | None = None) -> None:
