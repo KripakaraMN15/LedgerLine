@@ -46,8 +46,12 @@ class LLMCompletion:
     attempts: int
 
 
-def estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
-    serialized = json.dumps(messages, separators=(",", ":"), ensure_ascii=True)
+def estimate_prompt_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    prompt: Any = messages if tools is None else {"messages": messages, "tools": tools}
+    serialized = json.dumps(prompt, separators=(",", ":"), ensure_ascii=True)
     return max(1, math.ceil(len(serialized) / 4))
 
 
@@ -135,6 +139,7 @@ class LLMClient:
         fallback_model: str | None = None,
         fallback_on_budget: bool = False,
         headers: Mapping[str, str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 128,
         estimated_prompt_tokens: int | None = None,
         estimated_completion_tokens: int | None = None,
@@ -146,7 +151,7 @@ class LLMClient:
         prompt_tokens = (
             estimated_prompt_tokens
             if estimated_prompt_tokens is not None
-            else estimate_prompt_tokens(messages)
+            else estimate_prompt_tokens(messages, tools)
         )
         completion_tokens = (
             estimated_completion_tokens
@@ -193,6 +198,8 @@ class LLMClient:
                 "messages": messages,
                 "max_tokens": max_tokens,
             }
+            if tools is not None:
+                payload["tools"] = tools
             try:
                 response = await self._client.post(
                     self._url,
@@ -211,6 +218,8 @@ class LLMClient:
                 result: Any = response.json()
             except json.JSONDecodeError:
                 result = None
+            if response.is_success and result is None:
+                raise LLMResponseError("LLM returned malformed JSON")
             usage = result.get("usage") if isinstance(result, dict) else None
             if isinstance(usage, dict):
                 actual_cost = self._record_usage(

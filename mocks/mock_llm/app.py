@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 
+from mocks.shared_scenarios import SCENARIO_VENDOR_ID
+
 app = FastAPI(title="VendorOps Mock LLM")
 SUPPORTED_SCENARIOS = {
     "default",
@@ -45,7 +47,7 @@ def _environment_int(name: str, default: int) -> int:
 
 
 def _scenario_response(scenario: str, messages: list[Any]) -> tuple[str, str]:
-    vendor_id = "V-42"
+    vendor_id = SCENARIO_VENDOR_ID
     arguments: dict[str, Any] = {"vendor_id": vendor_id}
 
     if scenario in {"bad_params_then_ok", "always_bad_params", "schema_violating_args"}:
@@ -167,12 +169,37 @@ async def chat_completions(
             content={"error": {"message": "'messages' must be a list", "type": "invalid_request_error"}},
         )
 
+    completed_tool = scenario != "repeat_same_call" and any(
+        isinstance(message, dict)
+        and message.get("role") == "tool"
+        and isinstance(message.get("tool_call_id"), str)
+        for message in messages
+    )
     tool, arguments = _scenario_response(scenario, messages)
     prompt_tokens = _environment_int("MOCK_LLM_PROMPT_TOKENS", 128)
     completion_tokens = _environment_int("MOCK_LLM_COMPLETION_TOKENS", 32)
     if scenario == "expensive_budget":
         prompt_tokens = _environment_int("MOCK_LLM_EXPENSIVE_PROMPT_TOKENS", 10_000)
         completion_tokens = _environment_int("MOCK_LLM_EXPENSIVE_COMPLETION_TOKENS", 10_000)
+
+    assistant_message: dict[str, Any]
+    finish_reason: str
+    if completed_tool:
+        assistant_message = {"role": "assistant", "content": "Task completed."}
+        finish_reason = "stop"
+    else:
+        assistant_message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-mock-1",
+                    "type": "function",
+                    "function": {"name": tool, "arguments": arguments},
+                }
+            ],
+        }
+        finish_reason = "tool_calls"
 
     response = {
         "id": f"chatcmpl-mock-{time.time_ns()}",
@@ -182,18 +209,8 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call-mock-1",
-                            "type": "function",
-                            "function": {"name": tool, "arguments": arguments},
-                        }
-                    ],
-                },
-                "finish_reason": "tool_calls",
+                "message": assistant_message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {

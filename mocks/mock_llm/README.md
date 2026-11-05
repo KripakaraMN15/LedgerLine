@@ -3,6 +3,8 @@
 This service exposes `POST /v1/chat/completions` with OpenAI-compatible chat
 completion and tool-call response shapes. Select scripted behavior with the
 `X-Scenario` header. The default scenario returns a `get_vendor` tool call.
+Its vendor ID is shared with the mock vendor seed in
+`mocks/shared_scenarios.py`.
 
 Supported scenarios:
 

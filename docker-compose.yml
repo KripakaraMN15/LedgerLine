@@ -22,13 +22,15 @@ services:
 
   mock-llm:
     build:
-      context: ./mocks/mock_llm
+      context: .
+      dockerfile: mocks/mock_llm/Dockerfile
     ports:
       - '8001:8001'
 
   mock-vendor:
     build:
-      context: ./mocks/mock_vendor_api
+      context: .
+      dockerfile: mocks/mock_vendor_api/Dockerfile
     ports:
       - '8002:8002'
 

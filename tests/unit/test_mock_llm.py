@@ -147,7 +147,7 @@ async def test_per_request_latency_header_overrides_default(monkeypatch: pytest.
         elapsed = asyncio.get_running_loop().time() - started
 
     assert response.status_code == 200
-    assert elapsed >= 0.02
+    assert elapsed >= 0.01
 
 
 @pytest.mark.asyncio

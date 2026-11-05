@@ -5,9 +5,17 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from mocks.shared_scenarios import SCENARIO_VENDOR_ID
+
 app = FastAPI(title="VendorOps Mock Vendor API")
 
 VENDORS: dict[str, dict[str, Any]] = {
+    SCENARIO_VENDOR_ID: {
+        "id": SCENARIO_VENDOR_ID,
+        "name": "Example Vendor",
+        "status": "active",
+        "note": "Seeded for scripted LLM tool-call scenarios.",
+    },
     "V-100": {
         "id": "V-100",
         "name": "Acme Supplies",
@@ -29,6 +37,14 @@ VENDORS: dict[str, dict[str, Any]] = {
 }
 
 INVOICES: dict[str, list[dict[str, Any]]] = {
+    SCENARIO_VENDOR_ID: [
+        {
+            "id": "INV-4201",
+            "amount": 420.0,
+            "currency": "USD",
+            "status": "open",
+        }
+    ],
     "V-100": [
         {
             "id": "INV-1001",

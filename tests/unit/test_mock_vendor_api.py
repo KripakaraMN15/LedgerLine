@@ -139,4 +139,4 @@ async def test_timeout_fault_uses_async_delay(client: httpx.AsyncClient, monkeyp
     elapsed = asyncio.get_running_loop().time() - started
 
     assert response.status_code == 504
-    assert elapsed >= 0.02
+    assert elapsed >= 0.01

@@ -65,4 +65,8 @@ class TaskState(BaseModel):
     artifact: CodeArtifact | None = None
     verdict: ReviewVerdict | None = None
     history: list[ToolCall | ToolResult] = Field(default_factory=list)
+    loop_history: list[ToolCall] = Field(default_factory=list)
+    pending_tool_call: ToolCall | None = None
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    final_answer: str | None = None
     updated_at: datetime

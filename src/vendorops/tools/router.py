@@ -1,0 +1,326 @@
+import asyncio
+import json
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from pydantic import ValidationError
+
+from vendorops.llm.client import BudgetExceeded, LLMClient
+from vendorops.llm.loop import LoopDetected, ToolLoopDetector
+from vendorops.models import TaskState, ToolCall, ToolResult
+from vendorops.tools.registry import ToolRegistry
+
+MAX_VALIDATION_FEEDBACK_CHARS = 500
+Checkpoint = Callable[[], Awaitable[None]]
+
+
+class ToolRouter:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        llm_client: LLMClient,
+        *,
+        max_tool_retries: int = 2,
+        total_timeout: float = 30.0,
+    ) -> None:
+        if max_tool_retries < 0:
+            raise ValueError("max_tool_retries must be non-negative")
+        if total_timeout <= 0:
+            raise ValueError("total_timeout must be positive")
+        self._registry = registry
+        self._llm_client = llm_client
+        self._max_tool_retries = max_tool_retries
+        self._total_timeout = total_timeout
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return self._registry.openai_tools()
+
+    async def route(
+        self,
+        state: TaskState,
+        messages: list[dict[str, Any]],
+        *,
+        headers: dict[str, str] | None = None,
+        model: str = "mock-llm",
+        initial_response: dict[str, Any] | None = None,
+        loop_detector: ToolLoopDetector | None = None,
+        checkpoint: Checkpoint | None = None,
+    ) -> ToolResult:
+        try:
+            async with asyncio.timeout(self._total_timeout):
+                return await self._route(
+                    state,
+                    messages,
+                    headers=headers,
+                    model=model,
+                    initial_response=initial_response,
+                    loop_detector=loop_detector,
+                    checkpoint=checkpoint,
+                )
+        except TimeoutError:
+            pending_call = state.pending_tool_call
+            state.pending_tool_call = None
+            return self._failure(
+                state,
+                pending_call.id if pending_call is not None else "",
+                f"Tool call exceeded {self._total_timeout:g}s time limit",
+                int(self._total_timeout * 1000),
+            )
+
+    async def _route(
+        self,
+        state: TaskState,
+        messages: list[dict[str, Any]],
+        *,
+        headers: dict[str, str] | None,
+        model: str,
+        initial_response: dict[str, Any] | None,
+        loop_detector: ToolLoopDetector | None,
+        checkpoint: Checkpoint | None,
+    ) -> ToolResult:
+        try:
+            prompt = messages
+            schemas = self._registry.openai_tools()
+        except Exception as error:
+            return self._failure(state, "", str(error), 0)
+        for attempt in range(1, self._max_tool_retries + 2):
+            try:
+                if initial_response is not None:
+                    response = initial_response
+                    initial_response = None
+                else:
+                    completion = await self._llm_client.complete(
+                        state,
+                        prompt,
+                        model=model,
+                        headers=headers,
+                        tools=schemas,
+                    )
+                    response = completion.response
+                assistant_message, call_id, tool_name, raw_arguments = self._tool_call(response)
+                arguments = self._parse_arguments(raw_arguments)
+            except (BudgetExceeded, LoopDetected):
+                raise
+            except Exception as error:
+                return self._failure(state, "", str(error), 0)
+
+            tool = self._registry.get(tool_name)
+            if tool is None:
+                self._record_call(state, call_id, tool_name, arguments, attempt)
+                return self._failure(state, call_id, f"Unknown tool: {tool_name}", 0)
+
+            try:
+                tool.input_model.model_validate(arguments)
+            except ValidationError as error:
+                self._record_call(state, call_id, tool_name, arguments, attempt)
+                error_text = self._validation_feedback(error)
+                if attempt > self._max_tool_retries:
+                    return self._failure(state, call_id, error_text, 0)
+                prompt.extend(
+                    [
+                        assistant_message,
+                        {"role": "user", "content": error_text},
+                    ]
+                )
+                if checkpoint is not None:
+                    await checkpoint()
+                continue
+
+            self._record_call(state, call_id, tool_name, arguments, attempt)
+            if loop_detector is not None:
+                loop_detector.observe(tool_name, arguments)
+            tool_call = ToolCall(
+                id=call_id,
+                tool=tool_name,
+                args=arguments,
+                attempt=attempt,
+            )
+            state.loop_history.append(tool_call)
+            state.loop_history = state.loop_history[-2:]
+            state.pending_tool_call = tool_call
+            if checkpoint is not None:
+                prompt.append(assistant_message)
+                await checkpoint()
+            return await self.execute_pending(state, tool_call, messages=prompt, checkpoint=checkpoint)
+
+        return self._failure(state, "", "Tool validation retries exhausted", 0)
+
+    async def execute_pending(
+        self,
+        state: TaskState,
+        tool_call: ToolCall,
+        *,
+        messages: list[dict[str, Any]],
+        checkpoint: Checkpoint | None = None,
+    ) -> ToolResult:
+        try:
+            async with asyncio.timeout(self._total_timeout):
+                return await self._execute_pending(
+                    state,
+                    tool_call,
+                    messages=messages,
+                    checkpoint=checkpoint,
+                )
+        except TimeoutError:
+            state.pending_tool_call = None
+            result = self._failure(
+                state,
+                tool_call.id,
+                f"Tool call exceeded {self._total_timeout:g}s time limit",
+                int(self._total_timeout * 1000),
+            )
+            if checkpoint is not None:
+                await checkpoint()
+            return result
+
+    async def _execute_pending(
+        self,
+        state: TaskState,
+        tool_call: ToolCall,
+        *,
+        messages: list[dict[str, Any]],
+        checkpoint: Checkpoint | None,
+    ) -> ToolResult:
+        tool = self._registry.get(tool_call.tool)
+        if tool is None:
+            state.pending_tool_call = None
+            result = self._failure(
+                state,
+                tool_call.id,
+                f"Unknown tool: {tool_call.tool}",
+                0,
+            )
+            if checkpoint is not None:
+                await checkpoint()
+            return result
+        try:
+            validated = tool.input_model.model_validate(tool_call.args)
+        except ValidationError as error:
+            state.pending_tool_call = None
+            result = self._failure(
+                state,
+                tool_call.id,
+                self._validation_feedback(error),
+                0,
+            )
+            if checkpoint is not None:
+                await checkpoint()
+            return result
+
+        started = time.perf_counter()
+        try:
+            raw_output = await tool.handler(validated.model_dump(mode="json"))
+            output = tool.output_model.model_validate(raw_output)
+            output_data = output.model_dump(mode="json")
+            result = ToolResult(
+                call_id=tool_call.id,
+                ok=True,
+                output=output_data,
+                latency_ms=self._latency_ms(started),
+            )
+        except Exception as error:
+            result = ToolResult(
+                call_id=tool_call.id,
+                ok=False,
+                error=str(error) or "Tool execution failed",
+                latency_ms=self._latency_ms(started),
+            )
+        state.pending_tool_call = None
+        if result.ok:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.tool,
+                    "content": json.dumps(
+                        {"ok": True, "output": result.output},
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ),
+                }
+            )
+        self._record_result(state, result)
+        if checkpoint is not None:
+            await checkpoint()
+        return result
+
+    @staticmethod
+    def _tool_call(response: dict[str, Any]) -> tuple[dict[str, Any], str, str, Any]:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("LLM response does not contain a choice")
+        message = choices[0].get("message")
+        if not isinstance(message, dict):
+            raise ValueError("LLM response does not contain an assistant message")
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls or not isinstance(tool_calls[0], dict):
+            raise ValueError("LLM assistant message does not contain a tool call")
+        call = tool_calls[0]
+        function = call.get("function")
+        if not isinstance(function, dict):
+            raise ValueError("LLM tool call does not contain a function")
+        call_id = call.get("id")
+        tool_name = function.get("name")
+        raw_arguments = function.get("arguments")
+        if not isinstance(call_id, str) or not isinstance(tool_name, str):
+            raise ValueError("LLM tool call is missing its ID or function name")
+        return message, call_id, tool_name, raw_arguments
+
+    @staticmethod
+    def _parse_arguments(raw_arguments: Any) -> dict[str, Any]:
+        if isinstance(raw_arguments, str):
+            try:
+                raw_arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"LLM returned malformed tool arguments: {error}") from error
+        if not isinstance(raw_arguments, dict):
+            raise ValueError("LLM tool arguments must be a JSON object")
+        return raw_arguments
+
+    @staticmethod
+    def _validation_feedback(error: ValidationError) -> str:
+        details = [
+            {"loc": item["loc"], "msg": item["msg"], "type": item["type"]}
+            for item in error.errors(include_input=False)
+        ]
+        message = "Tool argument validation error: " + json.dumps(details, ensure_ascii=True)
+        if len(message) > MAX_VALIDATION_FEEDBACK_CHARS:
+            return message[: MAX_VALIDATION_FEEDBACK_CHARS - 3] + "..."
+        return message
+
+    @staticmethod
+    def _record_call(
+        state: TaskState,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        attempt: int,
+    ) -> None:
+        state.history.append(
+            ToolCall(id=call_id, tool=tool_name, args=arguments, attempt=attempt)
+        )
+
+    @staticmethod
+    def _latency_ms(started: float) -> int:
+        return max(0, round((time.perf_counter() - started) * 1000))
+
+    @staticmethod
+    def _failure(
+        state: TaskState,
+        call_id: str,
+        error: str,
+        latency_ms: int,
+    ) -> ToolResult:
+        result = ToolResult(
+            call_id=call_id,
+            ok=False,
+            error=error or "Tool execution failed",
+            latency_ms=latency_ms,
+        )
+        return ToolRouter._record_result(state, result)
+
+    @staticmethod
+    def _record_result(state: TaskState, result: ToolResult) -> ToolResult:
+        state.history.append(result)
+        return result
