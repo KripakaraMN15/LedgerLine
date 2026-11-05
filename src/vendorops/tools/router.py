@@ -4,6 +4,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
 from pydantic import ValidationError
 
 from vendorops.context import AssembledContext, ContextBudgetError
@@ -14,6 +15,7 @@ from vendorops.telemetry import set_span_error, tool_call_span
 from vendorops.tools.registry import ToolRegistry
 
 MAX_VALIDATION_FEEDBACK_CHARS = 500
+MAX_TOOL_REPAIR_ATTEMPTS = 3
 Checkpoint = Callable[[], Awaitable[None]]
 PromptAssembler = Callable[
     [TaskState, list[dict[str, Any]], list[dict[str, Any]]],
@@ -28,15 +30,19 @@ class ToolRouter:
         llm_client: LLMClient,
         *,
         max_tool_retries: int = 2,
+        max_tool_repair_attempts: int = MAX_TOOL_REPAIR_ATTEMPTS,
         total_timeout: float = 30.0,
     ) -> None:
         if max_tool_retries < 0:
             raise ValueError("max_tool_retries must be non-negative")
+        if max_tool_repair_attempts < 0:
+            raise ValueError("max_tool_repair_attempts must be non-negative")
         if total_timeout <= 0:
             raise ValueError("total_timeout must be positive")
         self._registry = registry
         self._llm_client = llm_client
         self._max_tool_retries = max_tool_retries
+        self._max_tool_repair_attempts = max_tool_repair_attempts
         self._total_timeout = total_timeout
 
     def schemas(self) -> list[dict[str, Any]]:
@@ -93,7 +99,11 @@ class ToolRouter:
             schemas = self._registry.openai_tools()
         except Exception as error:
             return self._failure(state, "", str(error), 0)
-        for attempt in range(1, self._max_tool_retries + 2):
+        attempt = 0
+        validation_retries = 0
+        repair_attempts = 0
+        while True:
+            attempt += 1
             try:
                 if initial_response is not None:
                     response = initial_response
@@ -144,8 +154,9 @@ class ToolRouter:
                     set_span_error(current_span, "ValidationError")
                 self._record_call(state, call_id, tool_name, arguments, attempt)
                 error_text = self._validation_feedback(error)
-                if attempt > self._max_tool_retries:
+                if validation_retries >= self._max_tool_retries:
                     return self._failure(state, call_id, error_text, 0)
+                validation_retries += 1
                 prompt.extend(
                     [
                         assistant_message,
@@ -176,12 +187,37 @@ class ToolRouter:
             state.loop_history.append(tool_call)
             state.loop_history = state.loop_history[-2:]
             state.pending_tool_call = tool_call
+            prompt.append(assistant_message)
             if checkpoint is not None:
-                prompt.append(assistant_message)
                 await checkpoint()
-            return await self.execute_pending(state, tool_call, messages=prompt, checkpoint=checkpoint)
-
-        return self._failure(state, "", "Tool validation retries exhausted", 0)
+            result = await self.execute_pending(
+                state,
+                tool_call,
+                messages=prompt,
+                checkpoint=checkpoint,
+            )
+            if result.ok or not result.retryable:
+                return result
+            if repair_attempts >= self._max_tool_repair_attempts:
+                return result
+            repair_attempts += 1
+            prompt.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.tool,
+                    "content": json.dumps(
+                        {
+                            "ok": False,
+                            "error": self._repair_feedback(result),
+                        },
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ),
+                }
+            )
+            if checkpoint is not None:
+                await checkpoint()
 
     async def execute_pending(
         self,
@@ -284,6 +320,12 @@ class ToolRouter:
                 ok=False,
                 error=str(error) or "Tool execution failed",
                 latency_ms=self._latency_ms(started),
+                retryable=self._is_repairable_error(error),
+                error_code=(
+                    error.response.status_code
+                    if isinstance(error, httpx.HTTPStatusError)
+                    else None
+                ),
             )
         state.pending_tool_call = None
         if result.ok:
@@ -349,6 +391,26 @@ class ToolRouter:
         return message
 
     @staticmethod
+    def _repair_feedback(result: ToolResult) -> str:
+        if result.error_code is not None:
+            summary = f"HTTP {result.error_code}"
+        else:
+            summary = "temporary execution error"
+        message = (
+            "Tool execution failed with a retryable "
+            f"{summary}. Correct the tool call and try again."
+        )
+        if len(message) > MAX_VALIDATION_FEEDBACK_CHARS:
+            return message[: MAX_VALIDATION_FEEDBACK_CHARS - 3] + "..."
+        return message
+
+    @staticmethod
+    def _is_repairable_error(error: Exception) -> bool:
+        if isinstance(error, httpx.HTTPStatusError):
+            return error.response.status_code == 404
+        return False
+
+    @staticmethod
     def _record_call(
         state: TaskState,
         call_id: str,
@@ -370,12 +432,15 @@ class ToolRouter:
         call_id: str,
         error: str,
         latency_ms: int,
+        *,
+        retryable: bool = False,
     ) -> ToolResult:
         result = ToolResult(
             call_id=call_id,
             ok=False,
             error=error or "Tool execution failed",
             latency_ms=latency_ms,
+            retryable=retryable,
         )
         return ToolRouter._record_result(state, result)
 
