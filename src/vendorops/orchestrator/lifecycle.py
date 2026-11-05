@@ -1,6 +1,6 @@
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,7 @@ class TaskRecord:
     trace_id: str | None
     created_at: datetime
     updated_at: datetime
+    was_created: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,13 +121,14 @@ class TaskRepository:
         goal: str,
         state: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        task_id: UUID | None = None,
     ) -> TaskRecord:
         if not idempotency_key.strip():
             raise ValueError("idempotency_key must not be empty")
         if not goal.strip():
             raise ValueError("goal must not be empty")
 
-        task_id = uuid4()
+        task_id = task_id or uuid4()
         initial_state = state if state is not None else {}
         async with self._engine.begin() as connection:
             result = await connection.execute(
@@ -184,7 +186,7 @@ class TaskRepository:
                     ),
                     {"task_id": row["id"], "status": TaskStatus.CREATED.value},
                 )
-            return _task_from_row(row)
+            return replace(_task_from_row(row), was_created=was_created)
 
     async def get_task(self, task_id: UUID | str) -> TaskRecord:
         parsed_id = UUID(str(task_id))
@@ -204,6 +206,10 @@ class TaskRepository:
         if row is None:
             raise TaskNotFound(parsed_id)
         return _task_from_row(row)
+
+    async def ping(self) -> None:
+        async with self._engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
 
     async def set_trace_id(self, task_id: UUID | str, trace_id: str) -> TaskRecord:
         parsed_id = UUID(str(task_id))
@@ -345,6 +351,28 @@ class TaskRepository:
             rows = result.mappings().all()
         return [_task_from_row(row) for row in rows]
 
+    async def find_recoverable_tasks(self, stale_before: datetime) -> list[TaskRecord]:
+        async with self._engine.connect() as connection:
+            result = await connection.execute(
+                text(
+                    """
+                    SELECT id, idempotency_key, goal, status, state,
+                           trace_id, created_at, updated_at
+                    FROM tasks
+                    WHERE status = :created
+                       OR (status = :running AND updated_at <= :stale_before)
+                    ORDER BY updated_at, id
+                    """
+                ),
+                {
+                    "created": TaskStatus.CREATED.value,
+                    "running": TaskStatus.RUNNING.value,
+                    "stale_before": stale_before,
+                },
+            )
+            rows = result.mappings().all()
+        return [_task_from_row(row) for row in rows]
+
     async def list_task_events(self, task_id: UUID | str) -> list[TaskEventRecord]:
         parsed_id = UUID(str(task_id))
         async with self._engine.connect() as connection:
@@ -373,9 +401,14 @@ class TaskRepository:
 
 
 async def apply_migrations(engine: AsyncEngine, directory: Path | None = None) -> None:
-    migration_directory = (
-        directory if directory is not None else Path(__file__).resolve().parents[3] / "migrations"
-    )
+    if directory is None:
+        source_directory = Path(__file__).resolve().parents[3] / "migrations"
+        working_directory = Path.cwd() / "migrations"
+        migration_directory = (
+            source_directory if source_directory.is_dir() else working_directory
+        )
+    else:
+        migration_directory = directory
     migration_files = sorted(migration_directory.glob("*.sql"))
     if not migration_files:
         raise FileNotFoundError(f"No SQL migrations found in {migration_directory}")

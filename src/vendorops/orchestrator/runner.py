@@ -66,6 +66,18 @@ class TaskRunner:
     async def run_tasks(self, task_ids: list[UUID | str]) -> list[TaskRecord | None]:
         return list(await asyncio.gather(*(self.submit(task_id) for task_id in task_ids)))
 
+    async def cancel_task(self, task_id: UUID | str, reason: str = "user_requested") -> TaskRecord:
+        key = str(task_id)
+        record = await self._repository.transition_task(
+            key,
+            TaskStatus.CANCELLED,
+            reason,
+        )
+        active = self._tasks.get(key)
+        if active is not None and not active.done():
+            active.cancel()
+        return record
+
     async def wait_idle(self) -> None:
         while self._tasks:
             await asyncio.gather(*tuple(self._tasks.values()), return_exceptions=True)
@@ -87,7 +99,7 @@ class TaskRunner:
     async def recover_stale(self, stale_before: datetime | None = None) -> int:
         if stale_before is None:
             stale_before = datetime.now(UTC) - self._stale_after
-        stale_tasks = await self._repository.find_running_tasks(stale_before)
+        stale_tasks = await self._repository.find_recoverable_tasks(stale_before)
         scheduled = 0
         for record in stale_tasks:
             try:

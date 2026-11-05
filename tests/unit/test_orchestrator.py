@@ -119,6 +119,17 @@ class MemoryRepository:
             if record.status is TaskStatus.RUNNING and record.updated_at <= stale_before
         ]
 
+    async def find_recoverable_tasks(self, stale_before: datetime) -> list[TaskRecord]:
+        return [
+            record
+            for record in self.records.values()
+            if record.status is TaskStatus.CREATED
+            or (
+                record.status is TaskStatus.RUNNING
+                and record.updated_at <= stale_before
+            )
+        ]
+
 
 class Input(BaseModel):
     vendor_id: str

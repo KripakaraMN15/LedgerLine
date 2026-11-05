@@ -55,7 +55,12 @@ class PriceTable:
 
 
 def load_price_table(path: Path | None = None) -> PriceTable:
-    price_file = path or Path(__file__).resolve().parents[3] / "config" / "prices.yaml"
+    if path is None:
+        source_file = Path(__file__).resolve().parents[3] / "config" / "prices.yaml"
+        working_directory_file = Path.cwd() / "config" / "prices.yaml"
+        price_file = source_file if source_file.is_file() else working_directory_file
+    else:
+        price_file = path
     with price_file.open("r", encoding="utf-8") as file:
         raw: Any = yaml.safe_load(file)
     if not isinstance(raw, dict) or not isinstance(raw.get("models"), dict):

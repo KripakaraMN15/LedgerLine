@@ -2,6 +2,13 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from vendorops.context import (
+    AssembledContext,
+    ContextRatios,
+    RetrievedDocument,
+    TokenCounter,
+    assemble,
+)
 from vendorops.llm.client import LLMClient
 from vendorops.llm.loop import ToolLoopDetector
 from vendorops.models import TaskState
@@ -29,15 +36,32 @@ class ReactAgent:
         headers: Mapping[str, str] | None = None,
         model: str = "mock-llm",
         max_iterations: int = 100,
+        system_prompt: str = (
+            "You are a vendor operations assistant. Use the available tools to "
+            "inspect vendor records and invoices, then provide a concise answer."
+        ),
+        context_limit: int = 8192,
+        reserved_output_tokens: int = 1024,
+        context_ratios: ContextRatios | None = None,
+        token_counter: TokenCounter | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
+        if context_limit < 1 or reserved_output_tokens < 0:
+            raise ValueError("Context and reserved-output limits must be positive")
+        if reserved_output_tokens >= context_limit:
+            raise ValueError("Reserved output tokens must be below the context limit")
         self._llm_client = llm_client
         self._router = router
         self._repository = repository
         self._headers = dict(headers or {})
         self._model = model
         self._max_iterations = max_iterations
+        self._system_prompt = system_prompt
+        self._context_limit = context_limit
+        self._reserved_output_tokens = reserved_output_tokens
+        self._context_ratios = context_ratios or ContextRatios()
+        self._token_counter = token_counter
 
     async def run(self, state: TaskState) -> TaskState:
         with span("agent.react", {"iteration_limit": self._max_iterations}) as current_span:
@@ -71,12 +95,15 @@ class ReactAgent:
                 continue
 
             await self._checkpoint(state)
+            schemas = self._router.schemas()
+            assembled = self._assemble_prompt(state, state.messages, schemas)
             completion = await self._llm_client.complete(
                 state,
-                state.messages,
+                assembled.messages,
                 model=self._model,
-                headers=self._headers,
-                tools=self._router.schemas(),
+                headers=self._headers_for_state(state),
+                tools=assembled.tools,
+                estimated_prompt_tokens=assembled.report.total_tokens,
             )
             await self._checkpoint(state)
             assistant_message = self._assistant_message(completion.response)
@@ -93,17 +120,60 @@ class ReactAgent:
             result = await self._router.route(
                 state,
                 state.messages,
-                headers=self._headers,
+                headers=self._headers_for_state(state),
                 model=self._model,
                 initial_response=completion.response,
                 loop_detector=loop_detector,
                 checkpoint=lambda: self._checkpoint(state),
+                prompt_assembler=self._assemble_prompt,
             )
             if not result.ok:
                 await self._checkpoint(state)
                 raise AgentToolError(result.error or "Tool execution failed")
 
         raise RuntimeError(f"Agent exceeded {self._max_iterations} iterations")
+
+    def _assemble_prompt(
+        self,
+        state: TaskState,
+        history: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+    ) -> AssembledContext:
+        documents: list[RetrievedDocument] = []
+        if state.findings is not None:
+            for index, fact in enumerate(state.findings.facts):
+                source = (
+                    state.findings.sources[index]
+                    if index < len(state.findings.sources)
+                    else None
+                )
+                content = f"{fact}\nSource: {source}" if source else fact
+                documents.append(
+                    RetrievedDocument(
+                        content=content,
+                        score=1.0,
+                        priority=0,
+                        document_id=f"finding-{index}",
+                    )
+                )
+        return assemble(
+            system_prompt=self._system_prompt,
+            tool_schemas=tool_schemas,
+            documents=documents,
+            history=history,
+            context_limit=self._context_limit,
+            reserved_output_tokens=self._reserved_output_tokens,
+            ratios=self._context_ratios,
+            token_counter=self._token_counter,
+        )
+
+    def _headers_for_state(self, state: TaskState) -> dict[str, str]:
+        headers = dict(self._headers)
+        if state.llm_scenario is not None:
+            headers["X-Scenario"] = state.llm_scenario
+        if state.llm_latency_ms is not None:
+            headers["X-Latency-Ms"] = str(state.llm_latency_ms)
+        return headers
 
     async def _checkpoint(self, state: TaskState) -> None:
         state.updated_at = datetime.now(UTC)

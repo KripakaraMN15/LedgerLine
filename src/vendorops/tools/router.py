@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from vendorops.context import AssembledContext, ContextBudgetError
 from vendorops.llm.client import BudgetExceeded, LLMClient
 from vendorops.llm.loop import LoopDetected, ToolLoopDetector
 from vendorops.models import TaskState, ToolCall, ToolResult
@@ -14,6 +15,10 @@ from vendorops.tools.registry import ToolRegistry
 
 MAX_VALIDATION_FEEDBACK_CHARS = 500
 Checkpoint = Callable[[], Awaitable[None]]
+PromptAssembler = Callable[
+    [TaskState, list[dict[str, Any]], list[dict[str, Any]]],
+    AssembledContext,
+]
 
 
 class ToolRouter:
@@ -47,6 +52,7 @@ class ToolRouter:
         initial_response: dict[str, Any] | None = None,
         loop_detector: ToolLoopDetector | None = None,
         checkpoint: Checkpoint | None = None,
+        prompt_assembler: PromptAssembler | None = None,
     ) -> ToolResult:
         try:
             async with asyncio.timeout(self._total_timeout):
@@ -58,6 +64,7 @@ class ToolRouter:
                     initial_response=initial_response,
                     loop_detector=loop_detector,
                     checkpoint=checkpoint,
+                    prompt_assembler=prompt_assembler,
                 )
         except TimeoutError:
             pending_call = state.pending_tool_call
@@ -79,6 +86,7 @@ class ToolRouter:
         initial_response: dict[str, Any] | None,
         loop_detector: ToolLoopDetector | None,
         checkpoint: Checkpoint | None,
+        prompt_assembler: PromptAssembler | None,
     ) -> ToolResult:
         try:
             prompt = messages
@@ -91,17 +99,27 @@ class ToolRouter:
                     response = initial_response
                     initial_response = None
                 else:
+                    assembled = (
+                        prompt_assembler(state, prompt, schemas)
+                        if prompt_assembler is not None
+                        else None
+                    )
                     completion = await self._llm_client.complete(
                         state,
-                        prompt,
+                        assembled.messages if assembled is not None else prompt,
                         model=model,
                         headers=headers,
-                        tools=schemas,
+                        tools=assembled.tools if assembled is not None else schemas,
+                        estimated_prompt_tokens=(
+                            assembled.report.total_tokens
+                            if assembled is not None
+                            else None
+                        ),
                     )
                     response = completion.response
                 assistant_message, call_id, tool_name, raw_arguments = self._tool_call(response)
                 arguments = self._parse_arguments(raw_arguments)
-            except (BudgetExceeded, LoopDetected):
+            except (BudgetExceeded, ContextBudgetError, LoopDetected):
                 raise
             except Exception as error:
                 return self._failure(state, "", str(error), 0)

@@ -69,4 +69,6 @@ class TaskState(BaseModel):
     pending_tool_call: ToolCall | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     final_answer: str | None = None
+    llm_scenario: str | None = None
+    llm_latency_ms: int | None = None
     updated_at: datetime

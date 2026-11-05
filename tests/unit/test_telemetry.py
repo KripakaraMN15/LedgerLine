@@ -105,6 +105,9 @@ class MemoryRepository:
     async def find_running_tasks(self, _stale_before: datetime) -> list[TaskRecord]:
         return []
 
+    async def find_recoverable_tasks(self, _stale_before: datetime) -> list[TaskRecord]:
+        return []
+
 
 @pytest_asyncio.fixture
 async def tracing_exporter() -> AsyncIterator[InMemorySpanExporter]:
