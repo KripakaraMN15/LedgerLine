@@ -23,7 +23,7 @@ class SandboxExecutor:
     def __init__(
         self,
         *,
-        image: str = "python:3.11-slim",
+        image: str = "python:3.11.14-slim",
         timeout_seconds: float = 10.0,
         max_output_bytes: int = 65_536,
         max_code_bytes: int = 1_000_000,
@@ -82,6 +82,8 @@ class SandboxExecutor:
                 container_name,
                 "--label",
                 _CONTAINER_LABEL,
+                "--pull",
+                "never",
                 "--network",
                 "none",
                 "--user",

@@ -59,7 +59,7 @@ jobs:
         env:
           REQUIRE_DOCKER: '1'
         run: |
-          docker pull python:3.11-slim
+          docker pull python:3.11.14-slim
           pytest tests/unit/test_sandbox.py -q
 
       - name: Run tests
