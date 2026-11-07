@@ -37,3 +37,11 @@ docker compose up --build
 The local Compose Phoenix service disables Phoenix authentication for the trace smoke check and
 publishes its UI and OTLP ports on loopback only. Do not reuse this development setting for a
 network-exposed Phoenix deployment.
+
+## Sandboxed Python tool
+
+`register_sandbox_tool(registry, SandboxExecutor())` adds `execute_python` to a tool registry used
+by `ToolRouter`. Execution requires a Docker daemon and starts a fresh, resource-limited container
+with no network or host mounts. Sandbox tests skip when Docker is unavailable locally; CI sets
+`REQUIRE_DOCKER=1` so missing Docker fails the job. The executor uses the version-tagged
+`python:3.11.14-slim` image and `--pull=never`; provision that image before accepting tasks.
